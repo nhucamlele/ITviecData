@@ -1,6 +1,7 @@
+
 """
 itviec_crawler_with_login_and_gitpush.py
-(Fixed: multi-page + formatted JSON output)
+(undetected-chromedriver + cookie import + skip duplicates + auto git push)
 """
 
 import os
@@ -15,20 +16,21 @@ from datetime import datetime, timedelta
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 
 # ==== CONFIG ====
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
 EXPORTED_CHROME_COOKIES = Path("chrome_cookies.json")
 COOKIE_PATH = Path("itviec_cookies.json")
-
-OUT_PATH = Path(r"D:\projects\ITViecData\itviec_jobs_data.json")
+OUT_PATH = Path(r"D:\projects\ITViecData\itviec_it_filtered.json")
 
 REPO_PATH = Path(r"D:\projects\ITViecData")
 REPO_URL = "https://github.com/nhucamlele/ITViecData.git"
 
 WAIT_TIMEOUT = 20
-DEFAULT_PAGES = 5
+DEFAULT_PAGES = 3  # có thể đổi số trang tại đây
 
 
 # ==== DRIVER ====
@@ -44,166 +46,211 @@ def init_uc_driver(headless=False):
     return driver, wait
 
 
-# ==== COOKIE ====
-def load_cookies(driver):
-    if EXPORTED_CHROME_COOKIES.exists():
-        with open(EXPORTED_CHROME_COOKIES, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-    elif COOKIE_PATH.exists():
-        with open(COOKIE_PATH, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-    else:
-        driver.get("https://itviec.com/sign_in")
-        print("➡️ Đăng nhập thủ công rồi nhấn Enter...")
-        input("Nhấn Enter khi đăng nhập xong...")
-        cookies = driver.get_cookies()
-        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cookies, f, ensure_ascii=False, indent=2)
-    driver.get("https://itviec.com")
+# ==== COOKIES ====
+def import_chrome_cookies(driver, cookie_json_path: Path, domain_hint="itviec.com"):
+    if not cookie_json_path.exists():
+        return False
+    with cookie_json_path.open("r", encoding="utf-8") as f:
+        cookies = json.load(f)
+    driver.get(f"https://{domain_hint}")
+    added = 0
     for c in cookies:
         try:
             driver.add_cookie({"name": c["name"], "value": c["value"]})
+            added += 1
         except:
             pass
     driver.refresh()
+    print(f"✅ Đã import {added} cookie từ {cookie_json_path}")
+    return added > 0
 
 
-# ==== UTIL ====
+def save_cookies_json(driver, path: Path):
+    cookies = driver.get_cookies()
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(cookies, f, ensure_ascii=False, indent=2)
+    print(f"✅ Đã lưu {len(cookies)} cookie vào {path}")
+
+
+def load_cookies_json(driver, path: Path, domain_hint="itviec.com"):
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8") as f:
+        cookies = json.load(f)
+    driver.get(f"https://{domain_hint}")
+    added = 0
+    for c in cookies:
+        try:
+            driver.add_cookie({"name": c["name"], "value": c["value"]})
+            added += 1
+        except:
+            pass
+    driver.refresh()
+    print(f"✅ Đã load {added} cookie từ {path}")
+    return added > 0
+
+
+def manual_login_and_save(driver, wait):
+    driver.get("https://itviec.com/sign_in")
+    print("➡️ Đăng nhập thủ công, sau đó quay lại terminal và nhấn Enter.")
+    input("Nhấn Enter khi đã đăng nhập xong...")
+    save_cookies_json(driver, COOKIE_PATH)
+
+
+# ==== UTILITIES ====
 def parse_posted_time(text):
     if not text:
         return ""
     text = text.lower().strip()
     now = datetime.now()
+    m_days = re.search(r"(\d+)\s*day", text)
+    if m_days:
+        return (now - timedelta(days=int(m_days.group(1)))).strftime("%Y-%m-%d")
+    m_hours = re.search(r"(\d+)\s*hour", text)
+    if m_hours:
+        return (now - timedelta(hours=int(m_hours.group(1)))).strftime("%Y-%m-%d")
     if "today" in text:
         return now.strftime("%Y-%m-%d")
     if "yesterday" in text:
         return (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    m = re.search(r"(\d+)\s*day", text)
-    if m:
-        return (now - timedelta(days=int(m.group(1)))).strftime("%Y-%m-%d")
-    m = re.search(r"(\d+)\s*hour", text)
-    if m:
-        return (now - timedelta(hours=int(m.group(1)))).strftime("%Y-%m-%d")
     return ""
 
 
-# ==== JOB LIST ====
-def get_job_list(driver, pages=DEFAULT_PAGES):
-    pattern = re.compile(r"https?://itviec\.com/it-jobs/[^/?#]+-\d+$", re.IGNORECASE)
-    urls = set()
+# ==== GET JOB LIST ====
+def get_job_list(driver, wait, pages=DEFAULT_PAGES):
+    pattern_valid = re.compile(r"https?://itviec\.com/it-jobs/[^/?#]+-\d+$", re.IGNORECASE)
+    all_job_urls = set()
 
     for page in range(1, pages + 1):
         url = f"https://itviec.com/it-jobs?page={page}"
-        print(f"📄 Đang mở trang {page}: {url}")
+        print("Mở:", url)
         driver.get(url)
-        time.sleep(random.uniform(3, 5))
+        time.sleep(random.uniform(2, 4))
+
+        elems = driver.find_elements(By.XPATH, "//*[@data-search--job-selection-job-url-value]")
+        for e in elems:
+            try:
+                slug = e.get_attribute("data-search--job-selection-job-slug-value")
+                if slug:
+                    candidate = f"https://itviec.com/it-jobs/{slug}".split("?")[0]
+                    if pattern_valid.match(candidate):
+                        all_job_urls.add(candidate)
+            except:
+                pass
 
         anchors = driver.find_elements(By.CSS_SELECTOR, "a[href*='/it-jobs/']")
         for a in anchors:
-            href = a.get_attribute("href")
-            if href and pattern.match(href.split("?")[0]):
-                urls.add(href.split("?")[0])
+            try:
+                href = a.get_attribute("href")
+                if href and pattern_valid.match(href.split("?")[0].split("#")[0]):
+                    all_job_urls.add(href.split("?")[0])
+            except:
+                pass
 
-        print(f"  -> Tổng cộng {len(urls)} link tích lũy.")
-    return list(urls)
+        print(f"  -> Tích lũy {len(all_job_urls)} link.")
+        time.sleep(random.uniform(1, 2))
+    return list(all_job_urls)
 
 
 # ==== CRAWL DETAIL ====
-def crawl_job(driver, url):
-    job_data = {}
+def crawl_job(driver, wait, url):
+    job = {"url": url}
     try:
         driver.get(url)
-        time.sleep(random.uniform(2, 3))
+        time.sleep(random.uniform(1.5, 2.5))
 
-        job_name = driver.find_element(By.CSS_SELECTOR, "h1.ipt-xl-6.text-it-black").text.strip()
-        company = driver.find_element(By.CSS_SELECTOR, "div.employer-name").text.strip()
-        address = driver.find_element(By.CSS_SELECTOR, "span.normal-text.text-rich-grey").text.strip()
-        work_type = driver.find_element(By.CSS_SELECTOR, "span.normal-text.text-rich-grey.ms-1").text.strip()
+        job["job_name"] = driver.find_element(By.CSS_SELECTOR, "h1.ipt-xl-6.text-it-black").text.strip()
+        job["company"] = driver.find_element(By.CSS_SELECTOR, "div.employer-name").text.strip()
+        job["address"] = driver.find_element(By.CSS_SELECTOR, "span.normal-text.text-rich-grey").text.strip()
+        job["type"] = driver.find_element(By.CSS_SELECTOR, "span.normal-text.text-rich-grey.ms-1").text.strip()
 
+        # posted date
         try:
-            posted_text = driver.find_element(By.XPATH, "//span[contains(text(),'Posted')]").text.strip()
-            posted_time = parse_posted_time(posted_text)
+            time_text = driver.find_element(By.XPATH, "//span[contains(text(),'Posted')]").text.strip()
+            job["posted_date"] = parse_posted_time(time_text)
         except:
-            posted_time = ""
+            job["posted_date"] = ""
 
-        skills = [el.text.strip() for el in driver.find_elements(By.CSS_SELECTOR, "div.d-flex.flex-wrap.igap-2 a") if el.text.strip()]
+        # skills
+        job["skills"] = [el.text.strip() for el in driver.find_elements(By.CSS_SELECTOR, "div.d-flex.flex-wrap.igap-2 a") if el.text.strip()]
 
+        # salary
         try:
-            salary = driver.find_element(By.CSS_SELECTOR, "div.salary span").text.strip()
+            job["salary"] = driver.find_element(By.CSS_SELECTOR, "div.salary span").text.strip()
         except:
             try:
-                salary = driver.find_element(By.CSS_SELECTOR, "div.salary").text.strip()
+                job["salary"] = driver.find_element(By.CSS_SELECTOR, "div.salary").text.strip()
             except:
-                salary = ""
+                job["salary"] = ""
 
-        company_industry, company_size, working_days = "", "", ""
-        rows = driver.find_elements(By.CSS_SELECTOR, "div.imt-4 div.row")
-        for row in rows:
-            try:
+        # company info
+        job["company_industry"] = ""
+        job["company_size"] = ""
+        job["working_days"] = ""
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "div.imt-4 div.row")
+            for row in rows:
                 label = row.find_element(By.CSS_SELECTOR, "div.col.text-dark-grey").text.strip().lower()
                 value = row.find_element(By.CSS_SELECTOR, "div.col.text-end.text-it-black").text.strip()
                 if "industry" in label:
-                    company_industry = value
+                    job["company_industry"] = value
                 elif "size" in label:
-                    company_size = value
+                    job["company_size"] = value
                 elif "working day" in label:
-                    working_days = value
-            except:
-                continue
-
-        # ✅ TRẢ VỀ DẠNG BẠN YÊU CẦU
-        job_data = {
-            "Url": url,
-            "Job name": job_name,
-            "Company Name": company,
-            "Address": address,
-            "Company type": work_type,
-            "Time": posted_time,
-            "Skills": skills,
-            "Salary": salary,
-            "Company industry": company_industry,
-            "Company size": company_size,
-            "Working days": working_days,
-        }
+                    job["working_days"] = value
+        except:
+            pass
 
     except Exception as e:
-        print(f"⚠️ Lỗi khi crawl {url}: {e}")
-    return job_data
+        print("⚠️ Lỗi crawl:", e)
+
+    return job
 
 
 # ==== MAIN ====
 def main():
-    print("=== ITVIEC SCRAPER (formatted JSON + git push) ===")
+    print("=== ITVIEC SCRAPER (skip duplicates + git push) ===")
     driver, wait = init_uc_driver(headless=False)
-    try:
-        load_cookies(driver)
 
-        # Load cũ nếu có
-        existing = []
-        seen = set()
+    try:
+        if EXPORTED_CHROME_COOKIES.exists():
+            import_chrome_cookies(driver, EXPORTED_CHROME_COOKIES)
+        elif COOKIE_PATH.exists():
+            load_cookies_json(driver, COOKIE_PATH)
+        else:
+            manual_login_and_save(driver, wait)
+
+        # load existing data
+        existing_jobs = []
+        seen_urls = set()
         if OUT_PATH.exists():
             with OUT_PATH.open("r", encoding="utf-8") as f:
-                existing = json.load(f)
-                seen = {j["Url"] for j in existing}
-            print(f"📂 Đã load {len(existing)} job cũ.")
+                existing_jobs = json.load(f)
+                seen_urls = {j["url"] for j in existing_jobs if "url" in j}
+            print(f"📂 Đã load {len(existing_jobs)} job cũ.")
 
-        # Lấy danh sách link mới
-        job_links = get_job_list(driver, pages=DEFAULT_PAGES)
-        new_links = [u for u in job_links if u not in seen]
+        # get new job list
+        job_links = get_job_list(driver, wait, pages=DEFAULT_PAGES)
+        print(f"🔗 Tìm được {len(job_links)} link mới (trước khi lọc trùng).")
+
+        # lọc trùng
+        new_links = [u for u in job_links if u not in seen_urls]
         print(f"🆕 Có {len(new_links)} job mới cần crawl.")
 
-        results = existing[:]
+        jobs = existing_jobs[:]
         for i, link in enumerate(new_links, 1):
             print(f"[{i}/{len(new_links)}] Crawl: {link}")
-            data = crawl_job(driver, link)
-            if data:
-                results.append(data)
+            job = crawl_job(driver, wait, link)
+            jobs.append(job)
+            time.sleep(random.uniform(1.5, 3))
 
+        # save
         with OUT_PATH.open("w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"✅ Đã lưu {len(results)} job vào {OUT_PATH}")
+            json.dump(jobs, f, ensure_ascii=False, indent=2)
+        print(f"✅ Lưu {len(jobs)} job vào {OUT_PATH}")
 
-        # GIT PUSH
+        # push to GitHub
+        print("🚀 Đang đẩy dữ liệu lên GitHub...")
         os.chdir(REPO_PATH)
         subprocess.run(["git", "add", "."], check=False)
         subprocess.run(["git", "commit", "-m", f"update {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"], check=False)
@@ -211,7 +258,10 @@ def main():
         print("🎉 Đã push lên GitHub thành công!")
 
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except:
+            pass
 
 
 if __name__ == "__main__":
